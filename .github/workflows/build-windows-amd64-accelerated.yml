@@ -1,0 +1,176 @@
+name: build-windows-amd64-accelerated
+
+# Navix addition: builds a Windows x64 JCEF binary distribution from a pinned
+# repository/ref and publishes it together with build_meta.json and checksums.
+# This file is additive; upstream workflows are left untouched.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'Git repository to clone'
+        required: true
+        default: 'https://github.com/CCBlueX/java-cef.git'
+      ref:
+        description: 'Git commit id to checkout (pinned)'
+        required: true
+        default: 'c0adcdfe516ef3a9ea40656c3b415f0d06f4636e'
+      build_type:
+        description: 'CMake build type'
+        required: true
+        default: 'Release'
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release_tag_name: ${{ env.release_tag_name }}
+      build_meta: ${{ env.build_meta }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Generate release info
+        run: |
+          cd release_gen
+          chmod +x create_release_info.sh
+          ./create_release_info.sh \
+            "${{ github.event.inputs.repo }}" \
+            "${{ github.event.inputs.ref }}" \
+            "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "${{ github.run_number }}" \
+            "${{ github.repository }}"
+      - name: Create or reuse Release
+        run: |
+          if gh release view "${{ env.release_tag_name }}" >/dev/null 2>&1; then
+            echo "Release ${{ env.release_tag_name }} already exists, reusing it."
+          else
+            gh release create "${{ env.release_tag_name }}" \
+              --title "${{ env.release_name }}" \
+              --notes-file release_gen/release_message.md
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Add LICENSE and build_meta.json
+        run: |
+          gh release upload "${{ env.release_tag_name }}" release_gen/LICENSE --clobber
+          gh release upload "${{ env.release_tag_name }}" release_gen/build_meta.json --clobber
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Announce build_meta.json download url to other jobs
+        run: |
+          cd release_gen
+          chmod +x announce_build_meta.sh
+          ./announce_build_meta.sh ${{ github.repository }}
+
+  build-windows-amd64:
+    runs-on: windows-2022
+    needs: create-release
+    timeout-minutes: 240
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        shell: cmd
+        run: |
+          compile_windows.bat amd64 ${{ github.event.inputs.build_type }} ${{ github.event.inputs.repo }} ${{ github.event.inputs.ref }}
+
+      - name: Verify distribution (accelerated-paint API + natives)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tar = 'out/binary_distrib.tar.gz'
+          if (-not (Test-Path $tar)) { throw "Missing $tar" }
+
+          New-Item -ItemType Directory -Force -Path verify | Out-Null
+          tar -xzf $tar -C verify bin/jcef.jar bin/lib/win64/jcef.dll bin/lib/win64/libcef.dll bin/lib/win64/jcef_helper.exe
+
+          # 1) Java API classes added by the accelerated-paint patch.
+          Copy-Item verify/bin/jcef.jar verify/jcef.zip
+          Expand-Archive verify/jcef.zip -DestinationPath verify/jcef -Force
+          $classes = @(
+            'org/cef/handler/CefAcceleratedPaintEvent.class',
+            'org/cef/handler/CefAcceleratedPaintInfo.class',
+            'org/cef/handler/CefAcceleratedPaintInfoWin.class',
+            'org/cef/browser/CefSharedTexture_N.class',
+            'org/cef/browser/CefRenderer.class'
+          )
+          $missing = @()
+          foreach ($c in $classes) {
+            if (Test-Path (Join-Path verify/jcef $c)) { Write-Host "OK   $c" }
+            else { Write-Host "MISS $c"; $missing += $c }
+          }
+          if ($missing.Count -gt 0) { throw "Accelerated-paint classes missing from jcef.jar: $($missing -join ', ')" }
+
+          # 2) Native JNI entry point for the Windows shared texture import.
+          $bytes = [System.IO.File]::ReadAllBytes('verify/bin/lib/win64/jcef.dll')
+          $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+          $symbol = 'Java_org_cef_browser_CefSharedTexture_1N_N_1BindD3D11Texture'
+          if (-not $ascii.Contains($symbol)) { throw "jcef.dll does not export $symbol" }
+          Write-Host "OK   jcef.dll exports $symbol"
+
+          # 3) CEF runtime files that must ship with the OSR browser.
+          foreach ($f in @('verify/bin/lib/win64/libcef.dll', 'verify/bin/lib/win64/jcef_helper.exe')) {
+            if (-not (Test-Path $f)) { throw "Missing $f" }
+            Write-Host ("OK   {0} ({1:N1} MB)" -f $f, ((Get-Item $f).Length / 1MB))
+          }
+
+          # 4) Record a compact inventory of the distribution for the build log.
+          tar -tzf $tar | Select-String -Pattern '^(bin/|bin/lib/win64/)' | Select-Object -First 60
+
+      - name: Publish distribution to release
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Move-Item out/binary_distrib.tar.gz out/windows-amd64.tar.gz -Force
+          $hash = (Get-FileHash out/windows-amd64.tar.gz -Algorithm SHA256).Hash.ToLower()
+          "$hash  windows-amd64.tar.gz" | Out-File -Encoding ascii out/windows-amd64.tar.gz.sha256
+          gh release upload "${{ needs.create-release.outputs.release_tag_name }}" out/windows-amd64.tar.gz out/windows-amd64.tar.gz.sha256 --clobber
+
+      - name: Export artifact for debugging
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-amd64-accelerated
+          path: out/windows-amd64.tar.gz
+          retention-days: 14
+          compression-level: 0
+
+  finalize:
+    runs-on: ubuntu-latest
+    needs: [create-release, build-windows-amd64]
+    permissions:
+      contents: write
+    steps:
+      - name: Download published assets and write SHA256SUMS
+        run: |
+          gh release download "${{ needs.create-release.outputs.release_tag_name }}" \
+            --repo "${{ github.repository }}" \
+            --pattern 'windows-amd64.tar.gz*' --dir assets
+          (cd assets && sha256sum -- *.tar.gz > SHA256SUMS)
+          cat assets/SHA256SUMS
+          gh release upload "${{ needs.create-release.outputs.release_tag_name }}" assets/SHA256SUMS --clobber
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build summary
+        run: |
+          {
+            echo "## Accelerated JCEF build"
+            echo ""
+            echo "- JCEF repository: ${{ github.event.inputs.repo }}"
+            echo "- JCEF ref: \`${{ github.event.inputs.ref }}\`"
+            echo "- Build type: ${{ github.event.inputs.build_type }}"
+            echo "- Platform: windows-amd64"
+            echo "- Release: ${{ needs.create-release.outputs.release_tag_name }}"
+            echo "- build_meta.json: ${{ needs.create-release.outputs.build_meta }}"
+            echo ""
+            echo "### Checksums"
+            echo '```'
+            cat assets/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
